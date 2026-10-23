@@ -35,7 +35,7 @@ TIMBER = re.compile(r"\bC(16|24)\b|C24|C16|FLITCH|TIMBER|\+\s*\d+\s*MM\s*PLATE|G
 TRIM = re.compile(r"TRIM", re.I)
 MEMBER_WORD = re.compile(r"\b(BEAM|TRIM\w*|LINTEL|FLITCH)\b", re.I)
 REF = re.compile(r"\b[A-Z]{1,3}\s?-\s?\d{1,2}\b|\b[A-Z]{1,3}\d{2}\b")
-TWO_NO = re.compile(r"\b(2\s*No\.?|2\s*/\s*\d+\s*x\s*\d+\s*(UC|UB))|(UC|UB|PFC)\s*x\s*2\b|DOUBLE BEAM", re.I)
+TWO_NO = re.compile(r"\b(2\s*(No\.?|NUMBER|NR)\b|2\s*/\s*\d+\s*x\s*\d+\s*(UC|UB))|(UC|UB|PFC)\s*x\s*2\b|DOUBLE BEAM", re.I)
 PROVISIONAL = re.compile(r"IF REQUIRED|\bALLOW\b|PROVISIONAL", re.I)
 EXISTING = re.compile(r"\bEXIST\w*|\bEXT\b", re.I)
 EXCLUDE = re.compile(
@@ -48,11 +48,27 @@ SPEC = re.compile(r"\d+\s*x\s*\d+.*?(UC|UB|PFC|SHS|RHS|CHS)|\d{2,3}\s*(UC|UB|SHS
                   r"(UC|UB)\s*\d{3}\s*x|C24|C16|FLITCH|GLULAM|\bLVL\b|PSL", re.I)
 LEGEND = re.compile(r"^\s*([A-Z]{1,3}\s*\d{1,3}(?:\s*(?:-|,|&|TO)\s*[A-Z]{0,3}\s*\d{1,3})*)\s*[-=:]\s+(.+)$", re.I)
 CODE = re.compile(r"^\s*([A-Z]{1,3})\s*-?\s*(\d{1,3})\b")
+WREF = re.compile(r"^\s*((?:[A-Z]+\s+){0,2}(?:BEAM|LINTEL|FRAME|TRIMMER|TRIM|COLUMN|POST|PURLIN|RAFTER|JOIST|BINDER))\s*(\d{1,3}[A-Z]?)\b", re.I)
+
+
+def wref_key(t):
+    m = WREF.match(t)
+    if not m:
+        return None
+    return re.sub(r"\s+", "", m.group(1)).upper() + m.group(2).upper()
+
+
+SOFT = re.compile(r"\b(ROOF|FLOOR|WALL|SLOPE)\b", re.I)
 
 
 def classify_text(t):
     """Return (kind, steel_cat) where kind is steel/timber/either/None."""
-    if len(t) > 70 or EXCLUDE.search(t):
+    if re.match(r"^\s*ALL\b|^\s*BEAM SIZE|SPAN \(M\)", t, re.I):
+        return None, None  # general notes and schedule headings
+    test = t
+    if STEEL_SECTION.search(t) or HOLLOW.search(t) or WREF.match(t):
+        test = SOFT.sub("", t)   # "ROOF FRAME 1 100x100x10 SHS" names a member; roof/floor/wall don't veto it
+    if len(t) > 70 or EXCLUDE.search(test):
         return None, None
     if EXISTING.search(t) and not PROVISIONAL.search(t):
         return None, None
@@ -222,7 +238,7 @@ def schedule_map(doc):
                     for ref in _expand_refs(lg.group(1)):
                         out.setdefault(ref, {"spec": spec, "column": bool(re.search(r"COLUMN|POST", spec, re.I))})
                     continue
-            if len(t) > 40 or not SPEC.search(t):
+            if len(t) > 40 or not (SPEC.search(t) or re.fullmatch(r"\s*(TBC|OMITTED|TBA)\s*", t, re.I)):
                 continue
             yc = (r.y0 + r.y1) / 2
             mates = [(u, q) for u, q in lines if q.x1 <= r.x0 + 1 and q.x0 > r.x0 - 320
@@ -250,6 +266,11 @@ def schedule_map(doc):
 
 def _expand_refs(t):
     t = t.upper()
+    w = re.match(r"^\s*((?:[A-Z]+\s+){0,2}(?:BEAM|LINTEL|FRAME|TRIMMER|TRIM|COLUMN|POST|PURLIN|RAFTER|JOIST|BINDER))"
+                 r"\s*(\d{1,3}[A-Z]?(?:\s*(?:,|&|AND)\s*\d{1,3}[A-Z]?)*)\b", t)
+    if w:
+        head = re.sub(r"\s+", "", w.group(1))
+        return [head + n for n in re.findall(r"\d{1,3}[A-Z]?", w.group(2))]
     m = re.match(r"^\s*([A-Z]{1,3})\s*(\d{1,3})\s*(?:-|TO)\s*([A-Z]{1,3})?\s*(\d{1,3})\b", t)
     if m and int(m.group(4)) >= int(m.group(2)) and int(m.group(4)) - int(m.group(2)) < 40:
         return [f"{m.group(1)}{i}" for i in range(int(m.group(2)), int(m.group(4)) + 1)]
@@ -431,47 +452,80 @@ def _ocr_fix(t, sched):
     return None
 
 
+def _lookup(t, sched, colprefix):
+    """Schedule entry for a note's reference: codes (B12, FC6) or words (BEAM 7B, TIMBER LINTEL 5)."""
+    m = CODE.match(t)
+    if m and not WREF.match(t):
+        key = f"{m.group(1).upper()}{int(m.group(2))}"
+        entry = sched.get(key)
+        if m.group(1).upper() in colprefix and not (entry and entry["column"]):
+            entry = {"spec": (entry or {}).get("spec", "column"), "column": True}
+        return entry
+    k = wref_key(t)
+    return sched.get(k) if k else None
+
+
 def labels(page, sched=None, columns=None):
+    """One label per note. The first line or two name the member; the rest is description."""
+    from notes import note_blocks, bbox_union
     out = []
     sched = sched or {}
     cells = sched.get("_cells", {}).get(page.number, [])
     colprefix = sched.get("_colprefix", set())
-    # callouts that describe a column ("C5 UNDER / 150X100X10 RHS") are column notes, not beams
-    colnotes = [fitz.Rect(ln["bbox"]) for ln in text_lines(page) if abs(ln["dir"][0]) > 0.9 and
-                re.match(r"^\s*(C\d+[A-Z]?\b|COLUMN|POST\b|.*\bCOLUMN OF\b)", ln["text"], re.I)]
+    lines = []
     for ln in text_lines(page):
-        r = fitz.Rect(ln["bbox"])
-        if abs(ln["dir"][0]) > 0.9 and any(0 <= r.y0 - c.y1 <= 4 + c.height and r.x0 < c.x1 and r.x1 > c.x0
-                                           for c in colnotes):
-            continue  # the size line under a column note ("C5 UNDER" / "150X100X10 RHS")
-        t = ln["text"]
         x0, y0, x1, y1 = ln["bbox"]
-        dx, dy = ln["dir"]
         if any(c.contains(fitz.Point((x0 + x1) / 2, (y0 + y1) / 2)) for c in cells):
             continue
-        m = CODE.match(t)
-        entry = sched.get(f"{m.group(1).upper()}{int(m.group(2))}") if m else None
-        if not entry and len(t) <= 8 and sched:
+        t = ln["text"]
+        if len(t) <= 8 and sched and not _lookup(t, sched, colprefix):
             fixed = _ocr_fix(t, sched)
             if fixed:
-                t = fixed
-                m = CODE.match(t)
-                entry = sched.get(f"{m.group(1).upper()}{int(m.group(2))}")
-        if m and m.group(1).upper() in colprefix and not (entry and entry["column"]):
-            entry = {"spec": (entry or {}).get("spec", "column"), "column": True}
-        if entry and entry["column"]:
-            if columns is not None and len(t) < 30:
-                columns.append(dict(text=f"{t} ({entry['spec']})", c=((x0 + x1) / 2, (y0 + y1) / 2),
-                                    bbox=fitz.Rect(x0, y0, x1, y1)))
+                ln = dict(ln, text=fixed)
+        lines.append(ln)
+
+    for blk in note_blocks(lines):
+        first = blk[0]["text"]
+        # header = first line, plus the second when the first names no size ("BEAM 17 - 2 NUMBER")
+        hdr = blk[:1]
+        if len(blk) > 1 and not (SPEC.search(first) or STEEL_SECTION.search(first) or HOLLOW.search(first)
+                                 or re.search(r"\d{2,3}\s*X\s*\d{2,3}", first, re.I)):
+            hdr = blk[:2]
+        t = " ".join(l["text"] for l in hdr)
+        x0, y0, x1, y1 = bbox_union(hdr)
+        dx, dy = blk[0]["dir"]
+        block_box = bbox_union(blk)
+
+        two = " ".join(l["text"] for l in blk[:2])
+        # column notes ("C5 UNDER / 150X100X10 RHS", "COLUMN OF BOX FRAME") are posts, not beams
+        entry = _lookup(first, sched, colprefix)
+        if (entry and entry["column"]) or re.match(r"^\s*(C\d+[A-Z]?\b|COLUMN|POST\b)", first, re.I) \
+                or re.search(r"\bCOLUMN\b|\bPOST\b", two, re.I) and not re.search(r"\bBEAM\b|LINTEL|TRIM", first, re.I):
+            if columns is not None and len(first) < 30:
+                columns.append(dict(text=f"{first} ({entry['spec']})" if entry else first,
+                                    c=((x0 + x1) / 2, (y0 + y1) / 2), bbox=fitz.Rect(x0, y0, x1, y1)))
             continue
-        if entry and not EXCLUDE.search(t) and len(t) < 60:
+        if entry and re.search(r"OMITTED", entry["spec"], re.I):
+            continue
+        sized = STEEL_SECTION.search(t) or HOLLOW.search(t)
+        if EXISTING.search(first) and not (PROVISIONAL.search(t) and sized) or re.match(r"^\s*EX\b", first, re.I):
+            continue  # existing structure stays uncoloured
+        two = " ".join(l["text"] for l in blk[:2])
+        if entry and not re.search(r"TBC", entry["spec"], re.I) and not EXCLUDE.search(first):
             kind, cat = classify_text(entry["spec"] + (" TRIM" if TRIM.search(t) else ""))
             t = f"{t} ({entry['spec']})" if entry["spec"] not in t else t
         else:
             kind, cat = classify_text(t)
+            if not kind and wref_key(first):
+                kind, cat = "either", "trimmer" if TRIM.search(first) else "beam"
+            if kind == "either" and re.search(r"\bBEAM\b|PFC|\bUC\b|\bUB\b", t, re.I) and not TIMBER.search(t):
+                kind = "steel"
         if not kind:
             continue
-        out.append(dict(text=t, kind=kind, cat=cat, bbox=[x0, y0, x1, y1], block=ln.get("block"),
+        if cat == "beam" and TRIM.search(two) and not re.search(r"TIMBER|C24|C16|\d\s*X\s*50\b", two, re.I):
+            cat = "trimmer"
+        out.append(dict(text=t, kind=kind, cat=cat, bbox=[x0, y0, x1, y1], block=block_box,
+                        lines=[l["bbox"] for l in blk], dir=(dx, dy),
                         c=((x0 + x1) / 2, (y0 + y1) / 2), th=_theta_from_dir(dx, dy),
                         pair=bool(TWO_NO.search(t)), provisional=bool(PROVISIONAL.search(t))))
     return out
@@ -658,19 +712,112 @@ def analyse_page(page, sched=None):
         cls = cl
     geoms = [dict(kind="line", labels=[], **{k: l[k] for k in ("th", "off", "p0", "p1")}) for l in cls]
 
-    def geom_for(b):
+    def geom_for(b, kind="bundle"):
         for g in geoms:
             if _coincident(g, b):
+                if kind == "box" and (g["p1"] - g["p0"]) > 1.3 * (b["p1"] - b["p0"]):
+                    continue  # a box keeps its own length; don't merge it into a longer line
+                if kind == "line" and (b["p1"] - b["p0"]) > 1.3 * (g["p1"] - g["p0"]) and _parallel(g["th"], b["th"], 2):
+                    g["p0"], g["p1"] = min(g["p0"], b["p0"]), max(g["p1"], b["p1"])  # full length of the member
                 return g
-        g = dict(kind="bundle", labels=[], **b)
+        g = dict(kind=kind, labels=[], **b)
         geoms.append(g)
         return g
+
+    from notes import thin_segments, find_leaders, bundles_at, point_seg_dist, boxes, box_at, box_beside
+    thin, heads = thin_segments(page)
+    rects = boxes(page)
+    led = set()
+    leaders = {id(lab): find_leaders(lab["block"], thin, heads, lab.get("lines"),
+                                     tuple(lab.get("dir", (1, 0))), segs)
+               for lab in labs if lab.get("block")}
+    lead_paths = [path for ls in leaders.values() for (_, _, _, path) in ls]
+
+    def on_leader(s):
+        a, b = (s[1], s[2]), (s[3], s[4])
+        for path in lead_paths:
+            for p_, q_ in zip(path, path[1:]):
+                if point_seg_dist(a, p_, q_) < 1.5 and point_seg_dist(b, p_, q_) < 1.5:
+                    return True
+        return False
+    segs_nl = [s_ for s_ in segs if not on_leader(s_)]
+
+    def leader_cands(lab, t):
+        """Follow the note's leader(s); return members found at the arrow tip."""
+        found = []
+        for tip, start, length, path in leaders.get(id(lab), []):
+            here = []
+            bx = box_at(tip, rects)
+            if bx:
+                here.append((0.5, geom_for(bx, "box")))   # a lintel or section drawn as a box right at the tip
+            for l in cl:
+                a, b = _endpoints(l["th"], l["off"], l["p0"], l["p1"])
+                d = point_seg_dist(tip, a, b)
+                if d <= 10 and l["p1"] - l["p0"] > 15:
+                    here.append((d, geom_for({k: l[k] for k in ("th", "off", "p0", "p1")}, "line")))
+            if not here or t in ("timber", "either"):
+                for bnd in bundles_at(tip, segs_nl):
+                    a, b = _endpoints(bnd["th"], bnd["off"], bnd["p0"], bnd["p1"])
+                    d = point_seg_dist(tip, a, b)
+                    pen = 0 if t in ("timber", "either") else 3
+                    here.append((d + pen, geom_for(bnd)))
+            if not here:
+                # a member drawn as one solid line (common for steel on some practices' plans)
+                for s_ in segs_nl:
+                    w_, x0_, y0_, x1_, y1_, L_, dashed_ = s_
+                    if L_ < 40 or w_ < 0.5:
+                        continue
+                    d = point_seg_dist(tip, (x0_, y0_), (x1_, y1_))
+                    if d <= 8:
+                        th_ = math.atan2(y1_ - y0_, x1_ - x0_) % math.pi
+                        ux_, uy_, nx_, ny_ = _frame(th_)
+                        p0_, p1_ = sorted((x0_ * ux_ + y0_ * uy_, x1_ * ux_ + y1_ * uy_))
+                        here.append((d + 5, geom_for(dict(th=th_, off=x0_ * nx_ + y0_ * ny_, p0=p0_, p1=p1_), "line")))
+            if not here:
+                # a short member drawn with only one or two heavy dashes (e.g. a 1.2 m double PFC)
+                heavy = [s_ for s_ in segs_nl if s_[0] >= 1.2 and s_[5] >= 6]
+                hit = [s_ for s_ in heavy if point_seg_dist(tip, (s_[1], s_[2]), (s_[3], s_[4])) <= 6]
+                if hit:
+                    s0 = min(hit, key=lambda s_: point_seg_dist(tip, (s_[1], s_[2]), (s_[3], s_[4])))
+                    th_ = math.atan2(s0[4] - s0[2], s0[3] - s0[1]) % math.pi
+                    ux_, uy_, nx_, ny_ = _frame(th_)
+                    o_ = s0[1] * nx_ + s0[2] * ny_
+                    run = sorted([s_ for s_ in heavy if _parallel(math.atan2(s_[4] - s_[2], s_[3] - s_[1]) % math.pi, th_, 4)
+                                  and abs(((s_[1] + s_[3]) / 2) * nx_ + ((s_[2] + s_[4]) / 2) * ny_ - o_) < 1.5],
+                                 key=lambda s_: min(s_[1] * ux_ + s_[2] * uy_, s_[3] * ux_ + s_[4] * uy_))
+                    p0_, p1_ = sorted((s0[1] * ux_ + s0[2] * uy_, s0[3] * ux_ + s0[4] * uy_))
+                    for s_ in run:   # extend through collinear dashes with small gaps
+                        q0, q1 = sorted((s_[1] * ux_ + s_[2] * uy_, s_[3] * ux_ + s_[4] * uy_))
+                        if q0 <= p1_ + 10 and q1 >= p0_ - 10:
+                            p0_, p1_ = min(p0_, q0), max(p1_, q1)
+                    here.append((1, geom_for(dict(th=th_, off=o_, p0=p0_, p1=p1_), "line")))
+            found += here
+        found.sort(key=lambda c: c[0])
+        return found
 
     # candidates for every label
     plan = []
     for lab in labs:
         t = _ltype(lab)
         cands = []
+        # a size written right along a steel line is that member; otherwise follow the leader
+        along_steel = False
+        for l in cls:
+            if _parallel(lab["th"], l["th"], 10):
+                along, off = _label_geom(lab, l["th"])
+                ux_, uy_, _, _ = _frame(l["th"])
+                bx0, by0, bx1, by1 = lab["bbox"]
+                ends = sorted((bx0 * ux_ + by0 * uy_, bx1 * ux_ + by1 * uy_))
+                if l["p0"] - 8 <= ends[0] and ends[1] <= l["p1"] + 8 and abs(off - l["off"]) <= 16:
+                    along_steel = True   # the whole label sits along this steel line
+                    break
+        lc = leader_cands(lab, t) if lab.get("block") and not along_steel else []
+        if lc:
+            # the leader says where the member is: trust it over anything drawn near the text
+            led.add(id(lab))
+            lab["leader"] = True
+            plan.append((lc[0][0] - 100, lab, t, lc))
+            continue
         if t in ("uc", "shs", "timber", "either"):
             for i, l in enumerate(cls):
                 if not _parallel(lab["th"], l["th"], 10):
@@ -692,6 +839,14 @@ def analyse_page(page, sched=None):
         if t in ("uc", "shs") and not cands:
             for d, b in _bundles_near(lab, segs, 0.1, 16)[:2]:
                 cands.append((d + 8, geom_for(b)))
+        is_lintel = re.search(r"LINTEL", lab["text"], re.I)
+        short_member = any(c[0] <= 24 and c[1]["p1"] - c[1]["p0"] <= 150 for c in cands)
+        if lab.get("block") and MEMBER_WORD.search(lab["text"]) and (not cands or is_lintel and not short_member):
+            bb = box_beside(lab["block"], rects)
+            if bb:
+                # a lintel is the box beside its note, not the floor lines running past it
+                cands = [(c[0] + 8, c[1]) for c in cands]
+                cands.append((bb[0], geom_for(bb[1], "box")))
         cands.sort(key=lambda c: c[0])
         plan.append((cands[0][0] if cands else 1e9, lab, t, cands))
 
@@ -785,20 +940,38 @@ def analyse(pdf_bytes):
 
 
 # ---------------------------------------------------------------- overlay
-def _area_is_clear(page, rect):
-    if any(fitz.Rect(w[:4]).intersects(rect) for w in page.get_text("words")):
-        return False
-    return not any(d["rect"].intersects(rect) and d["rect"].width < page.rect.width * 0.8
-                   for d in page.get_drawings())
-
-
-def _key_spot(page, w, h):
-    W, H = page.rect.width, page.rect.height
-    for r in (fitz.Rect(46, 36, 46 + w, 36 + h), fitz.Rect(W - 46 - w, 36, W - 46, 36 + h),
-              fitz.Rect(46, H - 36 - h, 46 + w, H - 36), fitz.Rect(W - 46 - w, H - 36 - h, W - 46, H - 36)):
-        if _area_is_clear(page, r):
-            return r
-    return fitz.Rect(46, 36, 46 + w, 36 + h)
+def _key_spot(page, w, h, pad=8):
+    """Find genuinely empty space for the key: render the page, then search for a blank
+    window (key plus a margin) with no ink at all. Prefers corners, then edges, then anywhere."""
+    import numpy as np
+    dpi = 36
+    sc = dpi / 72
+    pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+    ink = (img < 235).astype(np.int32)
+    ii = np.pad(ink.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+    kw, kh = int((w + 2 * pad) * sc) + 1, int((h + 2 * pad) * sc) + 1
+    H, W = ink.shape
+    margin = int(20 * sc)
+    if kw >= W - 2 * margin or kh >= H - 2 * margin:
+        return fitz.Rect(30, 30, 30 + w, 30 + h)
+    ys = np.arange(margin, H - margin - kh)
+    xs = np.arange(margin, W - margin - kw)
+    Y, X = np.meshgrid(ys, xs, indexing="ij")
+    sums = ii[Y + kh, X + kw] - ii[Y, X + kw] - ii[Y + kh, X] + ii[Y, X]
+    free = np.argwhere(sums == 0)
+    if len(free):
+        # closest to a page corner wins (keys are expected at corners; keeps the drawing area clear)
+        cy = ys[free[:, 0]] + kh / 2; cx = xs[free[:, 1]] + kw / 2
+        d = np.minimum.reduce([np.hypot(cx, cy), np.hypot(W - cx, cy), np.hypot(cx, H - cy), np.hypot(W - cx, H - cy)])
+        k = int(np.argmin(d))
+        y0, x0 = ys[free[k, 0]], xs[free[k, 1]]
+    else:
+        # nowhere fully clear: take the window covering the least ink
+        k = np.unravel_index(int(np.argmin(sums)), sums.shape)
+        y0, x0 = ys[k[0]], xs[k[1]]
+    X0 = x0 / sc + pad; Y0 = y0 / sc + pad
+    return fitz.Rect(X0, Y0, X0 + w, Y0 + h)
 
 
 def _draw_key(page, rect, used):

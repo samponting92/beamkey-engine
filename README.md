@@ -8,6 +8,11 @@ so results are exact, fast (about 1.5 seconds for a 5-sheet set) and cheap.
 
 ## How it works
 
+Reads drawings the way an engineer does: each note is read as a whole, and where a note has a
+leader (a thin line ending in an arrowhead or dot) the member is wherever the arrow points.
+Notes without a leader are matched to the member they are written along or sit beside.
+The key is placed in genuinely empty space found by scanning the rendered page.
+
 1. Reads every line in the PDF with its weight.
 2. Finds chain/dashed centrelines (steel) and bundles of parallel lines (timber, flitches).
 3. Reads the member labels (`152x152 UC30`, `TRIM F-02`, `2/150x50 C24 + 6mm plate`, `80x80 SHS`).
@@ -33,7 +38,7 @@ Results so far (23 Oct 2026):
 
 The 69a benchmark must stay at 0 false members after any change. Run it yourself:
 
-    (benchmark and sample drawings are kept outside the repository)
+    python tests/benchmark.py "tests/sample/69a Regents Park Road structural revC.pdf" tests/sample/69a-checked-members.json
 
 ## API
 
