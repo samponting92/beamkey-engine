@@ -306,15 +306,36 @@ def boxes(page):
     return out
 
 
-def box_at(tip, rects, tol=4):
-    """The smallest thin rectangle the arrow tip touches, as a member along its long axis."""
+def box_at(tip, rects, tol=8):
+    """The thin rectangle the arrow tip touches, as a member along its long axis. Pairs of
+    parallel boxes (a double PFC drawn one box per channel) become one member, and collinear
+    boxes either side of a pier are joined, as an engineer would read them."""
     hit = [r for r in rects if fitz.Rect(r.x0 - tol, r.y0 - tol, r.x1 + tol, r.y1 + tol).contains(fitz.Point(tip))]
     if not hit:
         return None
-    r = min(hit, key=lambda r: r.width * r.height)
-    if r.width >= r.height:
-        return dict(th=0.0, off=(r.y0 + r.y1) / 2, p0=r.x0, p1=r.x1)
-    return dict(th=math.pi / 2, off=-(r.x0 + r.x1) / 2, p0=r.y0, p1=r.y1)
+    r = min(hit, key=lambda r: (fitz.Rect(r).distance_to(fitz.Point(tip)) if hasattr(fitz.Rect, "distance_to") else 0,
+                                r.width * r.height))
+    horiz = r.width >= r.height
+    def axis(q):   # (offset of centre line, start, end, thickness)
+        return ((q.y0 + q.y1) / 2, q.x0, q.x1, q.height) if horiz else ((q.x0 + q.x1) / 2, q.y0, q.y1, q.width)
+    o, a0, a1, t = axis(r)
+    same = [q for q in rects if (q.width >= q.height) == horiz]
+    group = [q for q in same if abs(axis(q)[0] - o) <= 12 and abs(axis(q)[3] - t) <= 2]
+    # grow along the axis through collinear pieces with gaps up to 40 (a pier or wall)
+    changed = True
+    while changed:
+        changed = False
+        for q in group:
+            qo, q0, q1, qt = axis(q)
+            if q0 <= a1 + 40 and q1 >= a0 - 40 and (q0 < a0 or q1 > a1):
+                a0, a1 = min(a0, q0), max(a1, q1)
+                changed = True
+    used = [q for q in group if axis(q)[1] >= a0 - 1 and axis(q)[2] <= a1 + 1]
+    offs = [axis(q)[0] for q in used] or [o]
+    off = (min(offs) + max(offs)) / 2
+    if horiz:
+        return dict(th=0.0, off=off, p0=a0, p1=a1)
+    return dict(th=math.pi / 2, off=-off, p0=a0, p1=a1)
 
 
 def box_beside(block, rects, gap=16):
