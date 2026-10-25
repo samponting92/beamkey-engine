@@ -87,6 +87,8 @@ async def analyse(file: UploadFile = File(...)):
         if not p.pop("vector"):
             warnings.append(f"Sheet {i + 1} looks like a scan. Automatic placement needs a vector PDF, "
                             "so add members by hand on this sheet.")
+        for c in p.get("conflicts", []):
+            warnings.append(f"Sheet {i + 1}: {c}")
         if p.get("ocr"):
             warnings.append(f"Sheet {i + 1} has no text layer, so its labels were read by OCR. "
                             "Check member references carefully.")

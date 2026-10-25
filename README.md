@@ -4,7 +4,7 @@ The service behind beamkey.co.uk. It reads vector structural drawings and return
 red steel beams, orange steel trimmers, blue SHS/RHS and posts, green timber.
 
 The geometry finds where each member is. The labels say what it is. No AI is used for placement,
-so results are exact, fast (about 1.5 seconds for a 5-sheet set) and cheap.
+so results are repeatable, fast (1 to 4 seconds for a typical set) and cheap.
 
 ## How it works
 
@@ -26,15 +26,23 @@ tiles plus a whole-sheet pass, about 25 seconds a sheet. Beam and column schedul
 to sizes, and OCR slips ("Bi" for "B1") are corrected only when the result is a scheduled code.
 Grid lines (edge to edge, ending in a bubble) are ignored.
 
-Results so far (23 Oct 2026):
+Results so far (25 Oct 2026):
 
 | Set | Engineer style | Result |
 |---|---|---|
-| 69a Regent's Park Road | chain lines, full labels | 60 of 66 members exact, 0 false, 20 of 23 posts |
-| 11 Birch Hollow | dashes drawn as filled shapes, B-codes + schedule, grid lines | first floor 47 of 52 B-beams, roof 22 of 25, FC columns as posts |
-| Coach House | no text layer (OCR), legend codes | B1 x2, B2/B3, B4, roof frames RF1-7, ring beams; F1/F2 and angled C1-C4 labels missed |
+| 69a Regent's Park Road | chain lines, full labels | 58 of 66 members exact, 0 false, 21 of 23 posts |
+| 11 Birch Hollow | dashes drawn as filled shapes, B-codes + schedule, grid lines | each B-beam placed and split at its supports; schedule conflicts reported |
+| Coach House | no text layer (OCR), legend codes | B1 x2, B2/B3, B4, roof frames RF1-7 split per frame, ring beams |
 | 245 Elgin Ave | architect's Building Regs set | correctly finds almost nothing: no steel sizes on it |
-| Dunraven House, 41 Albert Bridge Rd | dash pairs, multi-line callouts, some leader lines, slab edges as dashed outlines | ground floor beams 1, 1A, 5, 6, 7A and PFC lintels; first floor ridge beams, roof frames, beam 9, 14B; beams 2, 3, 4, 7 left for review; 0 wrong colours seen |
+| Dunraven House, 41 Albert Bridge Rd | heavy dash pairs, notes with leaders, padstones, sections | every beam on ground and first floor placed by following its leader; columns placed where their arrows point; sections show cut members as squares |
+
+How a note is read, as a checking engineer would:
+1. Group the text into notes, then follow each note's leader to its arrow.
+2. At the arrow: heavy bars or dashes (a PFC, a triple SHS lintel) are the member, followed through gaps and
+   paired with their twins; otherwise a box, a centreline, or a double line.
+3. One line carrying several references (RIDGE BEAM 1, 1A, 2) is split at the columns, frames or padstones between them.
+4. On a section, beams lie flat or are cut end-on (marked with a square); columns stand up.
+5. A note's own size is checked against the schedule, and any difference is reported, not resolved.
 
 The 69a benchmark must stay at 0 false members after any change. Run it yourself:
 

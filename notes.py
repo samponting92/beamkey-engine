@@ -11,7 +11,21 @@ import re
 
 import pymupdf as fitz
 
-STARTS_NEW = re.compile(r"^\s*[A-Z]{1,3}\s*-?\s*\d{1,3}[A-Z]?\b|^\s*BEAM\s*\d", re.I)
+STARTS_NEW = re.compile(r"^\s*[A-Z]{1,3}\s*-?\s*\d{1,3}[A-Z]?\b|^\s*BEAM\s*\d"
+                        r"|^\s*(RIDGE|HIP|VALLEY|ROOF|CONSERV\w*|STEEL)\s+(BEAM|FRAME|LINTEL)\s*\d", re.I)
+
+
+_DRAW_CACHE = {}
+
+
+def drawings(page):
+    """drawings(page), read once per page (it is the slow part of reading a sheet)."""
+    key = (id(page.parent), page.number)
+    if key not in _DRAW_CACHE:
+        if len(_DRAW_CACHE) > 4:
+            _DRAW_CACHE.clear()
+        _DRAW_CACHE[key] = page.get_drawings()
+    return _DRAW_CACHE[key]
 
 
 # ---------------------------------------------------------------- note blocks
@@ -57,6 +71,11 @@ def note_blocks(lines):
             centred = abs((r["s0"] + r["s1"]) / 2 - (last["s0"] + last["s1"]) / 2) <= 4
             if not ((left or right) and gap <= 0.95 * h or centred and gap <= 0.6 * h):
                 continue
+            if len(b) >= 2:
+                # a clearly bigger gap than the note's own line spacing starts the next note
+                inner_gap = max(b[k + 1]["n0"] - b[k]["n1"] for k in range(len(b) - 1))
+                if gap > max(2.5 * inner_gap, 0.45 * h):
+                    continue
             best = b
             break
         if best is not None:
@@ -80,7 +99,7 @@ def bbox_union(items):
 def thin_segments(page):
     """Candidate leader segments: thin solid strokes in small drawings. Plus small filled arrowheads."""
     segs, heads = [], []
-    for d in page.get_drawings():
+    for d in drawings(page):
         items = d["items"]
         if d.get("type") in ("f", "fs"):
             r = d["rect"]
@@ -148,13 +167,45 @@ def _has_partner(a, b, all_segs, pen=None):
     return False
 
 
+_NODE_CACHE = {}
+
+
+def _endpoint_index(segs):
+    """Segment ends bucketed on a 2-point grid (with neighbours), so a leader can be followed
+    from one segment to the next without scanning every line on the sheet."""
+    key = id(segs)
+    hit = _NODE_CACHE.get(key)
+    if hit is not None and hit[0] is segs:
+        return hit[1]
+    idx = {}
+    for j, sg in enumerate(segs):
+        for (x, y) in ((sg[0], sg[1]), (sg[2], sg[3])):
+            gx, gy = round(x / 2), round(y / 2)
+            for ddx in (-1, 0, 1):
+                for ddy in (-1, 0, 1):
+                    lst = idx.setdefault((gx + ddx, gy + ddy), [])
+                    if not lst or lst[-1] != j:
+                        lst.append(j)
+    _NODE_CACHE.clear()
+    _NODE_CACHE[key] = (segs, idx)
+    return idx
+
+
 def find_leaders(block, segs, heads, lines=None, direction=(1, 0), all_segs=None):
     """Leader paths leaving a note: off the end of one of its lines, or straight off its top or
     bottom. Lines running along the text or touching its side are underlines and box edges.
     Returns list of (tip, start, length, path)."""
     x0, y0, x1, y1 = block
-    inner = fitz.Rect(x0 - 7, y0 - 7, x1 + 7, y1 + 7)
-    outer = fitz.Rect(x0 - 12, y0 - 12, x1 + 12, y1 + 12)
+
+    class _Box:   # plain-number point-in-box test (pymupdf's is slow when called a million times)
+        def __init__(self, a, b, c, d):
+            self.r = (a, b, c, d)
+
+        def contains(self, p):
+            return self.r[0] <= p[0] <= self.r[2] and self.r[1] <= p[1] <= self.r[3]
+    inner = _Box(x0 - 7, y0 - 7, x1 + 7, y1 + 7)
+    outer = _Box(x0 - 12, y0 - 12, x1 + 12, y1 + 12)
+    nodes = _endpoint_index(segs)
     ux, uy = direction
     nx, ny = -uy, ux
     lines = lines or [block]
@@ -170,10 +221,15 @@ def find_leaders(block, segs, heads, lines=None, direction=(1, 0), all_segs=None
         pen = sg[4:6]
         a, b = (ax, ay), (bx, by)
         for start, end in ((a, b), (b, a)):
-            if not inner.contains(fitz.Point(start)) or inner.contains(fitz.Point(end)):
+            if not outer.contains(start):
                 continue
             sx, sy = end[0] - start[0], end[1] - start[1]
             sl = math.hypot(sx, sy) or 1
+            if not inner.contains(start) and abs(sx * ux + sy * uy) / sl <= 0.8:
+                continue   # only a leader running on from a line end may start a little way off
+            stub = inner.contains(end)
+            if stub and (abs(sx * ux + sy * uy) / sl <= 0.8 or sl < 4):
+                continue   # only a short run off a line end may stay near the note before turning away
             sp_u = start[0] * ux + start[1] * uy
             sp_n = start[0] * nx + start[1] * ny
             ep_u = end[0] * ux + end[1] * uy
@@ -183,7 +239,9 @@ def find_leaders(block, segs, heads, lines=None, direction=(1, 0), all_segs=None
                 # runs with the text: must leave from the end of a line, at that line's height
                 for (su, sn) in spans:
                     if sn[0] - 4 <= sp_n <= sn[1] + 4:
-                        if (sp_u <= su[0] + 8 and ep_u < sp_u) or (sp_u >= su[1] - 8 and ep_u > sp_u):
+                        # (some leaders start a little under the last word)
+                        if (sp_u <= su[0] + 14 and ep_u < su[0] - 3 and ep_u < sp_u) or \
+                                (sp_u >= su[1] - 14 and ep_u > su[1] + 3 and ep_u > sp_u):
                             ok = True
                             break
             else:
@@ -201,8 +259,8 @@ def find_leaders(block, segs, heads, lines=None, direction=(1, 0), all_segs=None
                 if tip is not None:
                     break
                 nxt = None
-                for j, sj in enumerate(segs):
-                    cx, cy, dx_, dy_ = sj[:4]
+                for j in nodes.get((round(cur[0] / 2), round(cur[1] / 2)), ()):
+                    cx, cy, dx_, dy_ = segs[j][:4]
                     if j in used:
                         continue
                     c, d = (cx, cy), (dx_, dy_)
@@ -219,7 +277,11 @@ def find_leaders(block, segs, heads, lines=None, direction=(1, 0), all_segs=None
                 cur = nxt[1]
                 path.append(cur)
                 tip = _head_at(cur, path[-2], heads)
-            if length < 10 or length > 260 or (tip is not None and fitz.Rect(block).contains(fitz.Point(tip))):
+            along_text = abs(sx * ux + sy * uy) / sl > 0.8
+            # a very short arrow is only believed when it runs straight on from the end of a line
+            if length < (5 if along_text else 10) or length > 260 or (tip is not None and fitz.Rect(block).contains(fitz.Point(tip))):
+                continue
+            if stub and (tip is None or math.dist(tip, start) < 25):
                 continue
             if any(_has_partner(p_, q_, segs, pen) for p_, q_ in zip(path, path[1:])):
                 continue  # part of a double-line member drawing, not a leader
@@ -298,7 +360,7 @@ def boxes(page):
         if 2.0 <= short <= 14 and long_ >= 2.5 * short and long_ >= 15:
             out.append(r)
 
-    for d in page.get_drawings():
+    for d in drawings(page):
         items = d["items"]
         for it in items:
             if it[0] == "re":
