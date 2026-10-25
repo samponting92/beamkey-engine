@@ -630,6 +630,51 @@ def _dedupe(members):
     return out
 
 
+def _extend_member(g, segs, band=6, gap=12):
+    """Follow a member through one change of drafting style (boxes -> heavy dashes): carry on
+    along its axis only through dashes in the SAME pen (weight and position) that start right at
+    its end, and stop where that pen stops. A different pen means a different member or a bearing."""
+    th = g["th"]
+    ux, uy, nx, ny = _frame(th)
+    runs = []
+    for s_ in segs:
+        w, x0, y0, x1, y1, L, dashed = s_
+        if w < 1.2 or L < 2:
+            continue
+        if not _parallel(math.atan2(y1 - y0, x1 - x0) % math.pi, th, 3):
+            continue
+        o = ((x0 + x1) / 2) * nx + ((y0 + y1) / 2) * ny
+        if abs(o - g["off"]) > band:
+            continue
+        q0, q1 = sorted((x0 * ux + y0 * uy, x1 * ux + y1 * uy))
+        runs.append((q0, q1, round(w, 1), round(o, 0)))
+
+    def grow(end, sign):
+        # first run touching this end fixes the pen; then follow only that pen
+        start = [r for r in runs if (sign < 0 and r[1] <= end + 4 and end - r[1] <= gap and r[0] < end)
+                 or (sign > 0 and r[0] >= end - 4 and r[0] - end <= gap and r[1] > end)]
+        if not start:
+            return end
+        pen = {(r[2], r[3]) for r in start}
+        same = [r for r in runs if (r[2], r[3]) in pen]
+        changed = True
+        while changed:
+            changed = False
+            for q0, q1, _, _ in same:
+                if sign < 0 and q0 < end and q1 >= end - gap:
+                    end = q0; changed = True
+                if sign > 0 and q1 > end and q0 <= end + gap:
+                    end = q1; changed = True
+        return end
+
+    p0 = grow(g["p0"], -1)
+    p1 = grow(g["p1"], +1)
+    # never more than double the drawn length: beyond that it is another member
+    L = g["p1"] - g["p0"]
+    p0 = max(p0, g["p0"] - L); p1 = min(p1, g["p1"] + L)
+    return dict(g, p0=p0, p1=p1)
+
+
 def _ltype(lab):
     if lab["kind"] == "steel":
         return "shs" if lab["cat"] == "shs" else "uc"
@@ -749,6 +794,7 @@ def analyse_page(page, sched=None):
             here = []
             bx = box_at(tip, rects)
             if bx:
+                bx = _extend_member(bx, segs_nl)
                 here.append((0.5, geom_for(bx, "box")))   # a lintel or section drawn as a box right at the tip
             for l in cl:
                 a, b = _endpoints(l["th"], l["off"], l["p0"], l["p1"])

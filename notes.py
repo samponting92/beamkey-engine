@@ -289,20 +289,28 @@ def bundles_at(tip, segs_all, max_d=9):
 
 
 def boxes(page):
-    """Thin rectangles (lintels, steel sections, padstones drawn as boxes): (rect) list."""
+    """Thin rectangles (lintels, steel sections drawn as boxes): drawn as rectangles, or as a
+    closed outline of four straight lines."""
     out = []
+
+    def keep(r):
+        short, long_ = min(r.width, r.height), max(r.width, r.height)
+        if 2.0 <= short <= 14 and long_ >= 2.5 * short and long_ >= 15:
+            out.append(r)
+
     for d in page.get_drawings():
-        for it in d["items"]:
-            r = None
+        items = d["items"]
+        for it in items:
             if it[0] == "re":
-                r = fitz.Rect(it[1])
+                keep(fitz.Rect(it[1]))
             elif it[0] == "qu":
-                r = it[1].rect
-            if r is None:
-                continue
-            short, long_ = min(r.width, r.height), max(r.width, r.height)
-            if 1.0 <= short <= 14 and long_ >= 2.5 * short and long_ >= 15:
-                out.append(r)
+                keep(it[1].rect)
+        # a rectangle drawn as 4 axis-aligned lines that close on themselves
+        if 4 <= len(items) <= 5 and all(it[0] == "l" for it in items):
+            pts = [it[1] for it in items] + [items[-1][2]]
+            axis = all(abs(it[1].x - it[2].x) < 0.3 or abs(it[1].y - it[2].y) < 0.3 for it in items)
+            if axis and math.dist(pts[0], pts[-1]) < 1.0:
+                keep(fitz.Rect(min(p.x for p in pts), min(p.y for p in pts), max(p.x for p in pts), max(p.y for p in pts)))
     return out
 
 
@@ -313,14 +321,21 @@ def box_at(tip, rects, tol=8):
     hit = [r for r in rects if fitz.Rect(r.x0 - tol, r.y0 - tol, r.x1 + tol, r.y1 + tol).contains(fitz.Point(tip))]
     if not hit:
         return None
-    r = min(hit, key=lambda r: (fitz.Rect(r).distance_to(fitz.Point(tip)) if hasattr(fitz.Rect, "distance_to") else 0,
-                                r.width * r.height))
+    def dist(q):
+        dx = max(q.x0 - tip[0], 0, tip[0] - q.x1); dy = max(q.y0 - tip[1], 0, tip[1] - q.y1)
+        return math.hypot(dx, dy)
+    r = min(hit, key=lambda q: (round(dist(q), 1), q.width * q.height))
     horiz = r.width >= r.height
     def axis(q):   # (offset of centre line, start, end, thickness)
         return ((q.y0 + q.y1) / 2, q.x0, q.x1, q.height) if horiz else ((q.x0 + q.x1) / 2, q.y0, q.y1, q.width)
     o, a0, a1, t = axis(r)
     same = [q for q in rects if (q.width >= q.height) == horiz]
     group = [q for q in same if abs(axis(q)[0] - o) <= 12 and abs(axis(q)[3] - t) <= 2]
+    # a double member (two channels drawn as two boxes side by side) is read as one; a single box
+    # (a lintel, a padstone) stays exactly as drawn
+    partner = [q for q in group if 1.5 <= abs(axis(q)[0] - o) <= 12 and min(axis(q)[2], a1) - max(axis(q)[1], a0) > 0.5 * (a1 - a0)]
+    if not partner:
+        group = [r]
     # grow along the axis through collinear pieces with gaps up to 40 (a pier or wall)
     changed = True
     while changed:
